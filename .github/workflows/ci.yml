@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Both compilers, because -Wall -Wextra clean on one is not clean on both.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build every target
+        run: |
+          make
+          make quantize
+          make tok_test
+          make run_ids
+          make perplexity
+      - name: Warnings are failures
+        run: |
+          make clean
+          make CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror"
+
+  generate:
+    # The real test: does it actually produce text on a clean machine.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make
+      - name: Fetch the 15M model
+        run: ./scripts/download_model.sh
+      - name: Generate, and fail if nothing comes out
+        run: |
+          out=$(./mote models/stories15M.bin -i "Once upon a time")
+          echo "$out"
+          test "$(printf '%s' "$out" | wc -w)" -gt 20
