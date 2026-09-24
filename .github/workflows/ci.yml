@@ -24,9 +24,11 @@ jobs:
           make run_ids
           make perplexity
       - name: Warnings are failures
+        # The default build is single-threaded on purpose, so gcc sees the OpenMP
+        # pragmas without -fopenmp. Ignoring them there is the intent, not a bug.
         run: |
           make clean
-          make CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror"
+          make CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -Wno-unknown-pragmas"
 
   generate:
     # The real test: does it actually produce text on a clean machine.
