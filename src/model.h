@@ -10,6 +10,8 @@
 #define MOTE_MODEL_H
 
 #include <stddef.h>
+
+#include "error.h"   /* mote_last_error(), for the reason a load failed */
 #include <sys/types.h>
 #include "config.h"
 #include "quant.h"
@@ -17,10 +19,12 @@
 /* mote quantized format. The magic is the ASCII "mote" read as a little-endian
  * int32, which cannot collide with a legacy header (whose first int is `dim`).
  * v2 added optional QKV bias + rope_theta/eps in the header; v3 adds int4
- * weights (header slot 14 = bits). Writers stamp the lowest version that can
- * express the file, so int8 checkpoints stay readable by older runtimes. */
+ * weights (header slot 14 = bits); v4 adds optional per-head QK-norm (header
+ * slot 15 = has_qk_norm), the Qwen3 attention change. Writers stamp the lowest
+ * version that can express the file, so older checkpoints stay readable by
+ * older runtimes. */
 #define MQ_MAGIC   0x65746F6D
-#define MQ_VERSION 3
+#define MQ_VERSION 4
 #define MQ_HEADER  256          /* header padded to this, keeps weights aligned */
 
 /* Weight tensors. In the fp32 path the `float *` fields are live and the
@@ -36,6 +40,12 @@ typedef struct {
      * NULL when the checkpoint carries no bias. bq is (layer, dim); bk and bv are
      * (layer, kv_dim). Applied right after the q/k/v projections, before RoPE. */
     float *bq, *bk, *bv;
+
+    /* optional per-head QK-norm gains (Qwen3). RMSNorm applied to each query and
+     * key head, over head_size, right after the q/k projections and before RoPE.
+     * q_norm and k_norm are both (layer, head_size); NULL when absent. Stored
+     * permuted to mote's interleaved rotary layout, matching the q/k weights. */
+    float *q_norm, *k_norm;
 
     /* fp32 path */
     float *token_embedding;   /* (vocab, dim)                           */
@@ -77,6 +87,7 @@ typedef struct {
     float  rope_theta; /* RoPE base frequency (Llama 10000, Qwen 1000000) */
     float  rms_eps;    /* RMSNorm epsilon (Llama 1e-5, Qwen 1e-6)         */
     int    has_qkv_bias; /* 1 if bq/bk/bv are present                     */
+    int    has_qk_norm;  /* 1 if q_norm/k_norm are present (Qwen3)        */
     int    fd;         /* file descriptor of the mmap'd checkpoint */
     void  *data;       /* mmap base                                */
     ssize_t file_size;
@@ -84,14 +95,17 @@ typedef struct {
 
 /* Map the checkpoint (either format, auto-detected), wire up the weight
  * pointers, allocate scratch memory. Desktop convenience wrapper over the
- * portable loader below. */
-void build_transformer(Transformer *t, const char *checkpoint_path);
+ * portable loader below.
+ *
+ * Returns 0, or non-zero with the reason in mote_last_error(). Loads report
+ * rather than exit: see error.h for why that distinction matters off the CLI. */
+int build_transformer(Transformer *t, const char *checkpoint_path);
 
 /* Portable loader: bring the transformer up from a model blob already in
  * memory, a flash address on a microcontroller, the app bundle on iOS, or an
  * mmap on desktop. No files and no platform calls. The caller owns the blob and
  * must keep it alive for the transformer's lifetime. */
-void build_transformer_from_blob(Transformer *t, const void *blob, size_t size);
+int build_transformer_from_blob(Transformer *t, const void *blob, size_t size);
 
 /* Release scratch memory and unmap the checkpoint. */
 void free_transformer(Transformer *t);

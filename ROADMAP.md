@@ -12,6 +12,9 @@ coherent text from a pretrained model.
 - [x] Forward pass: RMSNorm, RoPE, grouped-query attention, KV cache, SwiGLU
 - [x] Byte-pair tokenizer: encode and decode
 - [x] Sampling: greedy, temperature, top-p
+- [x] Constrained decoding: a JSON schema compiled to a per-step mask over the
+      vocabulary, so a schema-invalid tool call is unreachable rather than
+      merely unlikely (`src/grammar.c`, `make grammar_test`)
 - [x] CLI with reproducible seeds and tokens/sec reporting
 
 ## 2. Quantize — done (int8 and int4)

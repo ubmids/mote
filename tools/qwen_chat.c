@@ -32,7 +32,8 @@ int main(int argc, char **argv)
             system = argv[i + 1];
 
     Transformer t;
-    build_transformer(&t, argv[1]);
+    if (build_transformer(&t, argv[1]) != 0)
+        return 1;
     BPETokenizer *tk = bpe_load(argv[2]);
     if (!tk) return 1;
 

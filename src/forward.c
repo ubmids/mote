@@ -33,6 +33,23 @@ static void rmsnorm(float *out, const float *x, const float *weight, int size, f
         out[i] = weight[i] * (ss * x[i]);
 }
 
+/* Qwen3 per-head QK-norm: RMSNorm each head of a q/k vector over head_size, in
+ * place, sharing one gain across heads. The gain is stored in mote's interleaved
+ * layout, matching the projected vector, so the element-wise multiply lines up
+ * and the mean-of-squares is order-invariant. */
+static void head_rmsnorm(float *vec, const float *gain, int n_heads, int head_size, float eps)
+{
+    for (int h = 0; h < n_heads; h++) {
+        float *p = vec + (long)h * head_size;
+        float ss = 0.0f;
+        for (int i = 0; i < head_size; i++)
+            ss += p[i] * p[i];
+        ss = 1.0f / sqrtf(ss / head_size + eps);
+        for (int i = 0; i < head_size; i++)
+            p[i] = gain[i] * (ss * p[i]);
+    }
+}
+
 static void softmax(float *x, int size)
 {
     float max = x[0];
@@ -159,6 +176,13 @@ float *forward(Transformer *t, int token, int pos)
             const float *bv = w->bv + (long)l * kv_dim;
             for (int i = 0; i < dim; i++)    s->q[i] += bq[i];
             for (int i = 0; i < kv_dim; i++) { k[i] += bk[i]; v[i] += bv[i]; }
+        }
+
+        /* Qwen3 QK-norm: normalize each query and key head before RoPE. v is
+         * left untouched, exactly as in the reference implementation. */
+        if (t->has_qk_norm) {
+            head_rmsnorm(s->q, w->q_norm + (long)l * head_size, p->n_heads, head_size, t->rms_eps);
+            head_rmsnorm(k,    w->k_norm + (long)l * head_size, p->n_kv_heads, head_size, t->rms_eps);
         }
 
         /* rotary position embedding on q and (within kv range) k */

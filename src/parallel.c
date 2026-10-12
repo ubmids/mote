@@ -4,6 +4,7 @@
 #if defined(__APPLE__)
 
 #include <dispatch/dispatch.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 void mote_parallel_for(int count, void (*fn)(int, int, void *), void *ctx)
@@ -11,8 +12,27 @@ void mote_parallel_for(int count, void (*fn)(int, int, void *), void *ctx)
     if (count <= 0)
         return;
 
+    /* MOTE_RESERVE_CORES leaves that many cores free. It exists for hosts with a
+     * UI: on iOS the matmul runs on a background queue, and pegging every core
+     * starves the main thread so the send button freezes during prefill. A CLI
+     * has no such problem and wants the throughput, so the default is 0 and the
+     * app build opts in with -DMOTE_RESERVE_CORES=1. */
+#ifndef MOTE_RESERVE_CORES
+#define MOTE_RESERVE_CORES 0
+#endif
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     int chunks = ncpu > 1 ? (int)ncpu : 1;
+    if (MOTE_RESERVE_CORES > 0 && chunks > MOTE_RESERVE_CORES + 1)
+        chunks -= MOTE_RESERVE_CORES;
+    /* MOTE_THREADS=n splits the work into exactly n chunks, so a benchmark can
+     * compare against another engine at the same thread count. Unset = all cores. */
+    static int forced = -1;            /* read once: this runs per matmul */
+    if (forced < 0) {
+        const char *mt = getenv("MOTE_THREADS");
+        forced = (mt && atoi(mt) > 0) ? atoi(mt) : 0;
+    }
+    if (forced > 0)
+        chunks = forced;
     if (chunks > count)
         chunks = count;
     if (chunks <= 1) {

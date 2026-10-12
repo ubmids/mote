@@ -24,6 +24,16 @@ tok_test
 qwen_chat
 lib_chat
 
+grammar_test
+intent_build
+intent_test
+
+# compiled command registries: generated from a model by tools/intent_build,
+# and model-specific, so they are rebuilt (make registry) rather than tracked.
+# The hand-written registry/*.txt sources are.
+registry/*.mint
+registry/*.h
+
 # wasm build output (web/build.sh)
 web/mote.js
 web/mote.wasm

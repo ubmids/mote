@@ -13,13 +13,13 @@ cd "$(dirname "$0")/.."
 
 emcc -O3 -std=c11 -msimd128 -pthread \
   src/model.c src/forward.c src/quant.c src/parallel.c \
-  src/tokenizer.c src/sampler.c src/bpe.c src/mote_lib.c \
+  src/tokenizer.c src/sampler.c src/bpe.c src/grammar.c src/intent.c src/mote_lib.c \
   -o web/mote.js \
   -sMODULARIZE=1 -sEXPORT_NAME=createMote \
   -sENVIRONMENT=worker \
   -sPTHREAD_POOL_SIZE=8 \
   -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 \
-  -sEXPORTED_FUNCTIONS=_mote_create,_mote_generate,_mote_embed,_mote_free,_mote_get_info,_malloc,_free \
+  -sEXPORTED_FUNCTIONS=_mote_create,_mote_generate,_mote_generate_constrained,_mote_grammar_compile,_mote_grammar_free,_mote_embed,_mote_intent_check,_mote_intent_id,_mote_intent_dim,_mote_intent_match,_mote_intent_rank,_mote_free,_mote_get_info,_malloc,_free \
   -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,addFunction,removeFunction,UTF8ToString,HEAPU8,HEAP32,HEAPF32 \
   -sALLOW_TABLE_GROWTH=1
 

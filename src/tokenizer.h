@@ -10,6 +10,8 @@
 
 #include <stddef.h>
 
+#include "error.h"
+
 typedef struct {
     const char *str;
     int id;
@@ -24,12 +26,15 @@ typedef struct {
     unsigned char byte_pieces[512];   /* raw byte -> 1-char string      */
 } Tokenizer;
 
-void build_tokenizer(Tokenizer *tk, const char *path, int vocab_size);
+/* Both loaders return 0, or non-zero with the reason in mote_last_error().
+ * A truncated tokenizer is exactly what a partial download leaves behind, so
+ * this must be reportable rather than fatal. */
+int build_tokenizer(Tokenizer *tk, const char *path, int vocab_size);
 
 /* Load the tokenizer from a blob already in memory (the app bundle on iOS,
  * flash on an MCU). The caller may free the blob afterwards; strings are copied. */
-void build_tokenizer_from_blob(Tokenizer *tk, const void *blob, size_t size,
-                               int vocab_size);
+int build_tokenizer_from_blob(Tokenizer *tk, const void *blob, size_t size,
+                              int vocab_size);
 
 void free_tokenizer(Tokenizer *tk);
 

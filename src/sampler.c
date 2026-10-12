@@ -110,8 +110,18 @@ void free_sampler(Sampler *s)
     free(s->probindex);
 }
 
-int sample(Sampler *s, float *logits)
+int sample_constrained(Sampler *s, float *logits, const unsigned char *allow)
 {
+    /* Masking happens on the logits, before the temperature divide and the
+     * softmax, so -1e30 survives as a finite float at any temperature and then
+     * exponentiates to a clean zero. A masked token cannot win the argmax, is
+     * never drawn from the CDF, and falls below top-p's cutoff, so all three
+     * strategies inherit the restriction without knowing about it. */
+    if (allow) {
+        for (int i = 0; i < s->vocab_size; i++)
+            if (!allow[i]) logits[i] = -1e30f;
+    }
+
     if (s->temperature == 0.0f)
         return argmax(logits, s->vocab_size);
 
@@ -123,4 +133,9 @@ int sample(Sampler *s, float *logits)
     if (s->topp <= 0.0f || s->topp >= 1.0f)
         return sample_mult(logits, s->vocab_size, coin);
     return sample_topp(logits, s->vocab_size, s->topp, s->probindex, coin);
+}
+
+int sample(Sampler *s, float *logits)
+{
+    return sample_constrained(s, logits, NULL);
 }

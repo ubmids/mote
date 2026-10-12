@@ -65,6 +65,7 @@ The engine is small enough to hold in your head:
 | `src/forward.c` | one token through the network, the core of the whole thing |
 | `src/tokenizer.c` | byte-pair encode/decode between text and token ids |
 | `src/sampler.c` | greedy, temperature, and top-p sampling |
+| `src/grammar.c` | compiles a JSON schema into a per-step mask over the vocabulary |
 | `src/quant.c` | int8 and int4 quantization: the pack, dequant, and integer matmuls |
 | `src/mote.c` | the CLI and the generation loop |
 | `tools/quantize.c` | converts an fp32 checkpoint to the quantized `.mq` format |
@@ -115,6 +116,39 @@ error and model quality are different objectives, only one of them is the point.
 Because quantized weights are a quarter (or an eighth) of the size, quantized
 models are also markedly faster to run, memory bandwidth is the bottleneck, not
 arithmetic.
+
+## Constrained decoding
+
+A small model asked for a tool call writes valid JSON only because valid JSON is
+likely, which is not the same as guaranteed, and the failures are the expensive
+kind: a missing brace, an invented key, an enum value nobody defined. So the
+sampler takes a mask. A JSON schema is compiled into a byte-level state machine;
+at each step the machine is run over every token's raw bytes and the tokens that
+could not continue a valid document have their logits pushed out of reach before
+the draw. Malformed output stops being unlikely and becomes unreachable.
+
+```c
+mote_grammar *g = mote_grammar_compile(m, schema_json, err, sizeof(err));
+mote_generate_constrained(m, prompt, &params, g, on_token, NULL);
+```
+
+Generation ends when the object closes, so the callback sees the document and
+nothing else. If the token budget runs out first, the shortest completion the
+schema allows is appended, so there is no truncated tail to handle. Passing no
+grammar leaves the sampling path exactly as it was, one branch aside.
+
+What is admitted is what a tool call needs: one flat object, keys in schema
+order, values typed string (with optional `enum`, `minLength`, `maxLength`),
+number, integer or boolean, plus `required`. A schema the machine cannot enforce
+is refused at compile time rather than half-enforced. `make grammar_test` runs
+the proof: the state machine against a table of legal and illegal documents,
+forced completion from every truncation point of a valid one, and the real engine
+under prompts written to break out — asking for prose, for extra keys, for an
+enum value the schema does not list, for deliberately broken JSON. Every reply is
+checked by a validator written from the schema by hand, sharing no code with the
+grammar. Unconstrained, none of those ten replies conform; constrained, all ten
+do. The mask costs 0.2 ms per step where the machine admits a couple of bytes
+and 3.2 ms in the middle of a free string, against ~14 ms for the forward pass.
 
 ## In a browser
 

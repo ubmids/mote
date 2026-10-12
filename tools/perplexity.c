@@ -55,7 +55,8 @@ int main(int argc, char **argv)
         if (argv[i][0] == '-' && argv[i][1] == 'z') tok_path = argv[i + 1];
 
     Transformer t;
-    build_transformer(&t, checkpoint);
+    if (build_transformer(&t, checkpoint) != 0)
+        return 1;
 
     /* either tokenizer scheme: a file starting with "MTOK" is byte-level BPE
      * (Qwen-class models), anything else is the legacy SentencePiece-style one */
@@ -70,7 +71,8 @@ int main(int argc, char **argv)
         bpe = bpe_load(tok_path);
         if (!bpe) return 1;
     } else {
-        build_tokenizer(&tk, tok_path, t.config.vocab_size);
+        if (build_tokenizer(&tk, tok_path, t.config.vocab_size) != 0)
+            return 1;
     }
 
     long len;

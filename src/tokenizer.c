@@ -9,6 +9,8 @@
  */
 #include "tokenizer.h"
 
+#include "error.h"
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,13 +21,18 @@ static int compare_tokens(const void *a, const void *b)
     return strcmp(((const TokenIndex *)a)->str, ((const TokenIndex *)b)->str);
 }
 
-void build_tokenizer_from_blob(Tokenizer *tk, const void *blob, size_t size,
-                               int vocab_size)
+int build_tokenizer_from_blob(Tokenizer *tk, const void *blob, size_t size,
+                              int vocab_size)
 {
     tk->vocab_size = vocab_size;
-    tk->vocab  = malloc(vocab_size * sizeof(char *));
-    tk->scores = malloc(vocab_size * sizeof(float));
+    /* calloc, not malloc: on a truncated file this returns early with only some
+     * entries filled, and free_tokenizer walks the whole array. NULL is what
+     * makes that walk safe. */
+    tk->vocab  = calloc((size_t)vocab_size, sizeof(char *));
+    tk->scores = calloc((size_t)vocab_size, sizeof(float));
     tk->sorted = NULL;
+    if (!tk->vocab || !tk->scores)
+        return mote_fail("out of memory loading the tokenizer");
     for (int i = 0; i < 256; i++) {
         tk->byte_pieces[i * 2] = (unsigned char)i;
         tk->byte_pieces[i * 2 + 1] = '\0';
@@ -34,46 +41,54 @@ void build_tokenizer_from_blob(Tokenizer *tk, const void *blob, size_t size,
     const uint8_t *p = (const uint8_t *)blob;
     const uint8_t *end = p + size;
 
-    if (p + sizeof(int) > end) {
-        fprintf(stderr, "mote: bad tokenizer header\n"); exit(1);
-    }
+    if (p + sizeof(int) > end)
+        return mote_fail("tokenizer is %llu bytes, too small to hold a header",
+                         (unsigned long long)size);
     memcpy(&tk->max_token_length, p, sizeof(int));
     p += sizeof(int);
 
     for (int i = 0; i < vocab_size; i++) {
-        if (p + sizeof(float) + sizeof(int) > end) {
-            fprintf(stderr, "mote: truncated tokenizer\n"); exit(1);
-        }
+        if (p + sizeof(float) + sizeof(int) > end)
+            return mote_fail("tokenizer is truncated — ran out at token %d of %d",
+                             i, vocab_size);
         memcpy(tk->scores + i, p, sizeof(float));
         p += sizeof(float);
         int len;
         memcpy(&len, p, sizeof(int));
         p += sizeof(int);
-        if (len < 0 || p + len > end) {
-            fprintf(stderr, "mote: truncated tokenizer string\n"); exit(1);
-        }
-        tk->vocab[i] = malloc(len + 1);
+        if (len < 0 || p + len > end)
+            return mote_fail("tokenizer is truncated — token %d of %d claims "
+                             "%d bytes with %lld left", i, vocab_size, len,
+                             (long long)(end - p));
+        tk->vocab[i] = malloc((size_t)len + 1);
+        if (!tk->vocab[i])
+            return mote_fail("out of memory loading the tokenizer");
         memcpy(tk->vocab[i], p, len);
         p += len;
         tk->vocab[i][len] = '\0';
     }
+    return 0;
 }
 
-void build_tokenizer(Tokenizer *tk, const char *path, int vocab_size)
+int build_tokenizer(Tokenizer *tk, const char *path, int vocab_size)
 {
     /* desktop convenience: read the file into memory, then parse the blob */
     FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "mote: couldn't open tokenizer %s\n", path); exit(1); }
+    if (!f)
+        return mote_fail("couldn't open tokenizer %s", path);
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     uint8_t *buf = malloc(sz > 0 ? (size_t)sz : 1);
     if (!buf || sz < 0 || fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
-        fprintf(stderr, "mote: couldn't read tokenizer %s\n", path); exit(1);
+        free(buf);
+        fclose(f);
+        return mote_fail("couldn't read tokenizer %s", path);
     }
     fclose(f);
-    build_tokenizer_from_blob(tk, buf, (size_t)sz, vocab_size);
+    int rc = build_tokenizer_from_blob(tk, buf, (size_t)sz, vocab_size);
     free(buf);   /* vocab strings were copied out, so the buffer is done */
+    return rc;
 }
 
 void free_tokenizer(Tokenizer *tk)
@@ -108,7 +123,9 @@ static int str_lookup(const char *str, TokenIndex *sorted, int n)
 void encode(Tokenizer *tk, const char *text, int bos, int eos,
             int *tokens, int *n_tokens)
 {
-    if (!text) { fprintf(stderr, "mote: null text to encode\n"); exit(1); }
+    /* Encoding nothing is not a reason to take the process down. The one
+     * remaining exit() in this file used to live here. */
+    if (!text) { *n_tokens = 0; return; }
 
     if (!tk->sorted) {
         tk->sorted = malloc(tk->vocab_size * sizeof(TokenIndex));

@@ -1,0 +1,120 @@
+# registry/apartment.txt — the commands an apartment answers to, and the ways
+# people actually ask for them.
+#
+# Format: a line "[id]" opens a command; every non-blank line after it is one
+# phrasing. Blank lines and lines starting with # are ignored. Nothing else is
+# syntax, because this file is meant to be edited by whoever lives here, not by
+# whoever wrote the parser.
+#
+# tools/intent_build compiles this into vectors once; the device then matches
+# against them with a single forward pass per utterance and no generation at
+# all. Which means the only thing that changes behaviour here is the wording
+# below, so write it the way it is said out loud: short, clipped, half a
+# sentence, complaining about the room rather than naming the device.
+
+[lights_on]
+turn on the lights
+lights on
+turn the lights on
+switch on the lights
+it's too dark in here
+give me some light
+can you put the light on
+
+[lights_off]
+turn off the lights
+lights off
+turn the lights off
+switch off the lights
+kill the lights
+lights out
+shut the lights off
+
+[lights_dim]
+dim the lights
+turn the lights down
+lower the lights
+make it dimmer
+too bright in here
+soften the lighting
+half the brightness
+
+[temperature_up]
+turn the heating up
+make it warmer
+warmer please
+it's freezing in here
+turn up the temperature
+crank the heat
+raise the thermostat
+
+[temperature_down]
+turn the heating down
+make it cooler
+cooler please
+it's boiling in here
+turn down the temperature
+put the aircon on
+lower the thermostat
+
+[music_play]
+play some music
+put music on
+play something
+start the music
+give me some tunes
+music please
+put a record on
+
+[music_pause]
+pause the music
+pause
+stop the music
+hold the music
+silence
+cut the music
+stop playing
+
+[volume_up]
+turn the volume up
+louder
+volume up
+turn it up
+I can't hear it
+crank it up
+raise the volume
+
+[volume_down]
+turn the volume down
+quieter
+volume down
+turn it down
+it's too loud
+keep it down
+lower the volume
+
+[time_query]
+what's the time
+what time is it
+tell me the time
+got the time
+how late is it
+time check
+
+[weather_query]
+what's the weather
+what's it like outside
+is it going to rain
+weather today
+do I need a coat
+how hot is it outside
+forecast please
+
+[door_lock]
+lock the door
+lock up
+lock the front door
+is the door locked
+bolt the door
+secure the door
+lock everything

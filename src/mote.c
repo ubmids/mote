@@ -122,12 +122,14 @@ int main(int argc, char **argv)
     if (seed == 0) seed = (unsigned long long)now_ms();
 
     Transformer transformer;
-    build_transformer(&transformer, checkpoint);
+    if (build_transformer(&transformer, checkpoint) != 0)
+        return 1;
     if (steps <= 0 || steps > transformer.config.seq_len)
         steps = transformer.config.seq_len;
 
     Tokenizer tokenizer;
-    build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+    if (build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size) != 0)
+        return 1;
 
     Sampler sampler;
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, seed);

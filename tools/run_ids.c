@@ -41,7 +41,8 @@ int main(int argc, char **argv)
     }
 
     Transformer t;
-    build_transformer(&t, argv[1]);
+    if (build_transformer(&t, argv[1]) != 0)
+        return 1;
 
     int pos = 0, token = ids[0];
     /* run the prompt through to fill the KV cache; keep the last logits */

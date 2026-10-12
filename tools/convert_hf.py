@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-tools/convert_hf.py — convert a HuggingFace Qwen2 checkpoint into mote's .mq format.
+tools/convert_hf.py — convert a HuggingFace Qwen2/Qwen3 checkpoint into mote's .mq format.
 
-mote's engine is Llama-shaped. Qwen2 is close but differs in three ways this script
-reconciles:
+mote's engine is Llama-shaped. Qwen is close but differs in ways this script
+reconciles, auto-detected from which tensors the checkpoint actually carries:
 
-  1. Attention bias. Qwen has a bias on q/k/v; Llama does not. These are written to
-     the .mq (v2) and added in the forward pass before RoPE.
-  2. RoPE base and norm epsilon. Qwen uses theta=1e6 and eps=1e-6; they go in the
+  1. Attention bias (Qwen2). Qwen2 has a bias on q/k/v; Llama and Qwen3 do not.
+     Present ones are written to the .mq (v2) and added before RoPE.
+  2. QK-norm (Qwen3). Qwen3 drops the bias and instead RMSNorms each query and
+     key head (a per-head-dim gain) before RoPE. Present gains are written to the
+     .mq (v4) and applied in the forward pass. A checkpoint has one or the other,
+     never both.
+  3. RoPE base and norm epsilon. Qwen uses theta=1e6 and eps=1e-6; they go in the
      header so the runtime uses the right constants.
-  3. Rotary layout. Every HF checkpoint stores q_proj/k_proj in the "rotate-half"
+  4. Rotary layout. Every HF checkpoint stores q_proj/k_proj in the "rotate-half"
      arrangement, while mote (following llama2.c) rotates interleaved pairs. So the
-     q/k weights AND their biases are permuted back to interleaved here. Miss this
-     and the model emits fluent-looking nonsense.
+     q/k weights, their biases, AND the per-head QK-norm gains are permuted back to
+     interleaved here. Miss this and the model emits fluent-looking nonsense.
 
 The big matrices are quantized to symmetric int8 (default) or packed int4
 (--bits 4) with one fp32 scale per group, exactly what mote's runtime
@@ -31,19 +35,45 @@ import struct
 import numpy as np
 
 MQ_MAGIC = 0x65746F6D
-MQ_VERSION = 2
 MQ_HEADER = 256
+
+
+def _read_safetensors(path):
+    """Parse one .safetensors file to {name: fp32 numpy}, using only numpy — no
+    torch, no safetensors package. Handles F32/F16/BF16 (the dtypes HF ships),
+    converting bf16 to fp32 by widening the 16-bit mantissa/exponent into the top
+    half of a float32, which is exact."""
+    with open(path, "rb") as fh:
+        (hlen,) = struct.unpack("<Q", fh.read(8))
+        header = json.loads(fh.read(hlen))
+        blob = fh.read()
+    out = {}
+    for name, meta in header.items():
+        if name == "__metadata__":
+            continue
+        dt = meta["dtype"]
+        lo, hi = meta["data_offsets"]
+        raw = blob[lo:hi]
+        shape = meta["shape"]
+        if dt == "F32":
+            a = np.frombuffer(raw, dtype=np.float32)
+        elif dt == "F16":
+            a = np.frombuffer(raw, dtype=np.float16).astype(np.float32)
+        elif dt == "BF16":
+            u16 = np.frombuffer(raw, dtype=np.uint16).astype(np.uint32)
+            a = (u16 << 16).view(np.float32)
+        else:
+            raise SystemExit(f"{name}: unsupported safetensors dtype {dt}")
+        out[name] = a.reshape(shape).astype(np.float32)
+    return out
 
 
 def load_hf(path):
     """Load every safetensors shard as fp32 numpy, plus the config."""
-    from safetensors import safe_open  # ships with transformers
     cfg = json.load(open(os.path.join(path, "config.json")))
     sd = {}
     for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
-        with safe_open(f, framework="pt") as st:   # "pt" handles bf16 -> float()
-            for k in st.keys():
-                sd[k] = st.get_tensor(k).float().numpy().astype(np.float32)
+        sd.update(_read_safetensors(f))
     if not sd:
         raise SystemExit(f"no .safetensors found in {path}")
     return sd, cfg
@@ -136,38 +166,66 @@ def main():
         raise SystemExit(f"gs {gs} must divide dim {D} and hidden {HD}")
     if NH * head_size != D:
         raise SystemExit("mote requires dim == n_heads * head_size")
+    # Qwen3 can set head_dim independently of hidden_size/heads; mote's engine
+    # assumes head_size == dim/n_heads, so reject the mismatch loudly.
+    head_dim_cfg = int(cfg.get("head_dim", head_size))
+    if head_dim_cfg != head_size:
+        raise SystemExit(f"mote requires head_dim ({head_dim_cfg}) == dim/n_heads ({head_size})")
 
     def g(name):
         return sd[name]
 
-    # ---- assemble fp32 side (norms + biases), per-layer stacked ----
+    def has(name):
+        return name in sd
+
+    # Qwen2 carries q/k/v bias; Qwen3 carries per-head q_norm/k_norm instead.
+    # Detect from the checkpoint rather than assuming a family.
+    has_qkv_bias = has("model.layers.0.self_attn.q_proj.bias")
+    has_qk_norm = has("model.layers.0.self_attn.q_norm.weight")
+
+    # ---- assemble fp32 side (norms, + biases or qk-norm), per-layer stacked ----
     rms_att = np.stack([g(f"model.layers.{l}.input_layernorm.weight") for l in range(L)])
     rms_ffn = np.stack([g(f"model.layers.{l}.post_attention_layernorm.weight") for l in range(L)])
     rms_final = g("model.norm.weight")
-    bq = np.stack([permute_reverse(g(f"model.layers.{l}.self_attn.q_proj.bias"), NH, head_size) for l in range(L)])
-    bk = np.stack([permute_reverse(g(f"model.layers.{l}.self_attn.k_proj.bias"), NKV, head_size) for l in range(L)])
-    bv = np.stack([g(f"model.layers.{l}.self_attn.v_proj.bias") for l in range(L)])
+    if has_qkv_bias:
+        bq = np.stack([permute_reverse(g(f"model.layers.{l}.self_attn.q_proj.bias"), NH, head_size) for l in range(L)])
+        bk = np.stack([permute_reverse(g(f"model.layers.{l}.self_attn.k_proj.bias"), NKV, head_size) for l in range(L)])
+        bv = np.stack([g(f"model.layers.{l}.self_attn.v_proj.bias") for l in range(L)])
+    if has_qk_norm:
+        # one gain per head-dim position, shared across heads. Permute it with the
+        # same within-head reordering the q/k weights get, so it lines up in the
+        # interleaved layout the runtime multiplies against.
+        qn = np.stack([permute_reverse(g(f"model.layers.{l}.self_attn.q_norm.weight"), 1, head_size) for l in range(L)])
+        kn = np.stack([permute_reverse(g(f"model.layers.{l}.self_attn.k_norm.weight"), 1, head_size) for l in range(L)])
 
     print(f"config: dim={D} hidden={HD} layers={L} heads={NH}/{NKV} vocab={V} "
           f"seq={seq_len} theta={rope_theta:g} eps={rms_eps:g} shared={shared} "
-          f"gs={gs} bits={args.bits}", flush=True)
+          f"gs={gs} bits={args.bits} qkv_bias={has_qkv_bias} qk_norm={has_qk_norm}", flush=True)
 
     with open(args.out, "wb") as f:
         # header: 64 int32 slots (256 bytes). Stamp the lowest version that can
-        # express the file, so int8 output still loads on a v2 runtime.
+        # express the file, so simpler checkpoints still load on older runtimes:
+        # v4 needs qk-norm, v3 needs int4, else v2.
+        version = 4 if has_qk_norm else (3 if args.bits == 4 else 2)
         h = [0] * (MQ_HEADER // 4)
-        h[0] = MQ_MAGIC; h[1] = 3 if args.bits == 4 else 2
+        h[0] = MQ_MAGIC; h[1] = version
         h[2] = D; h[3] = HD; h[4] = L; h[5] = NH; h[6] = NKV; h[7] = V; h[8] = seq_len
         h[9] = gs; h[10] = 1 if shared else 0
-        h[11] = 1  # has_qkv_bias
+        h[11] = 1 if has_qkv_bias else 0
         f.write(struct.pack("<12i", *h[:12]))
         f.write(struct.pack("<f", rope_theta))   # slot 12 as float
         f.write(struct.pack("<f", rms_eps))      # slot 13 as float
         f.write(struct.pack("<i", args.bits))    # slot 14
-        f.write(b"\x00" * (MQ_HEADER - 15 * 4))
+        f.write(struct.pack("<i", 1 if has_qk_norm else 0))   # slot 15
+        f.write(b"\x00" * (MQ_HEADER - 16 * 4))
 
-        # fp32 norms, then fp32 biases
-        for a in (rms_att, rms_ffn, rms_final, bq, bk, bv):
+        # fp32 norms, then (bias xor qk-norm) — same order map_weights_quant reads
+        fp32_blocks = [rms_att, rms_ffn, rms_final]
+        if has_qkv_bias:
+            fp32_blocks += [bq, bk, bv]
+        if has_qk_norm:
+            fp32_blocks += [qn, kn]
+        for a in fp32_blocks:
             f.write(np.ascontiguousarray(a, dtype=np.float32).tobytes())
 
         # quantized tensors, in the order the loader maps them
