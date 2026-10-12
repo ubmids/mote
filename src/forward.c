@@ -137,9 +137,15 @@ float *forward(Transformer *t, int token, int pos)
     RunState *s = &t->state;
 
     int dim = p->dim;
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     int kv_mul = p->n_heads / p->n_kv_heads;
-    int head_size = dim / p->n_heads;
+    /* A head is dim / n_heads wide unless the checkpoint says otherwise (.mq v5;
+     * Qwen3-0.6B runs 16 heads of 128 over a 1024-wide stream). The query and
+     * the attention output are n_heads heads wide, k and v n_kv_heads; wq maps
+     * dim -> q_dim and wo maps q_dim back to dim. With the default head_size
+     * every width below is the one this code always used. */
+    int head_size = t->head_dim;
+    int q_dim = p->n_heads * head_size;
+    int kv_dim = p->n_kv_heads * head_size;
     int hidden_dim = p->hidden_dim;
     float *x = s->x;
 
@@ -164,17 +170,17 @@ float *forward(Transformer *t, int token, int pos)
         float *k = s->key_cache + loff + (long)pos * kv_dim;
         float *v = s->value_cache + loff + (long)pos * kv_dim;
 
-        mm(t, s->q, s->xb, dim, dim,     w->wq, &w->q_wq, (long)l * dim * dim);
+        mm(t, s->q, s->xb, dim, q_dim,   w->wq, &w->q_wq, (long)l * dim * q_dim);
         mm(t, k,    s->xb, dim, kv_dim,  w->wk, &w->q_wk, (long)l * dim * kv_dim);
         mm(t, v,    s->xb, dim, kv_dim,  w->wv, &w->q_wv, (long)l * dim * kv_dim);
 
         /* Qwen-style attention bias, added to the projections before RoPE. The
          * converter permutes bq/bk to match mote's interleaved rotary layout. */
         if (t->has_qkv_bias) {
-            const float *bq = w->bq + (long)l * dim;
+            const float *bq = w->bq + (long)l * q_dim;
             const float *bk = w->bk + (long)l * kv_dim;
             const float *bv = w->bv + (long)l * kv_dim;
-            for (int i = 0; i < dim; i++)    s->q[i] += bq[i];
+            for (int i = 0; i < q_dim; i++)  s->q[i] += bq[i];
             for (int i = 0; i < kv_dim; i++) { k[i] += bk[i]; v[i] += bv[i]; }
         }
 
@@ -186,9 +192,9 @@ float *forward(Transformer *t, int token, int pos)
         }
 
         /* rotary position embedding on q and (within kv range) k */
-        for (int i = 0; i < dim; i += 2) {
-            int head_dim = i % head_size;
-            float freq = 1.0f / powf(t->rope_theta, head_dim / (float)head_size);
+        for (int i = 0; i < q_dim; i += 2) {
+            int hd = i % head_size;           /* position within this head */
+            float freq = 1.0f / powf(t->rope_theta, hd / (float)head_size);
             float val = pos * freq;
             float fcr = cosf(val), fci = sinf(val);
             int rotn = i < kv_dim ? 2 : 1;
@@ -225,7 +231,7 @@ float *forward(Transformer *t, int token, int pos)
             }
         }
 
-        mm(t, s->xb2, s->xb, dim, dim, w->wo, &w->q_wo, (long)l * dim * dim);
+        mm(t, s->xb2, s->xb, q_dim, dim, w->wo, &w->q_wo, (long)l * q_dim * dim);
         for (int i = 0; i < dim; i++)
             x[i] += s->xb2[i];
 

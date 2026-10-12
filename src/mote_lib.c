@@ -123,6 +123,7 @@ void mote_get_info(const mote *m, mote_info_t *out)
     out->seq_len = c->seq_len;
     out->quantized = m->t.quantized;
     out->qbits = m->t.qbits;
+    out->head_dim = m->t.head_dim;
 }
 
 /* Repetition penalty over a sliding window of the tokens generated so far in
@@ -492,7 +493,7 @@ int mote_embed(mote *m, const char *text, float *out)
      * positions [0, n) — the same slots the generation prefix cache relies on.
      * Save those slots, run the embed, then restore them, so an embed call is
      * invisible to the next generate() (its cached prefix survives intact). */
-    int kv_dim = (m->t.config.dim * m->t.config.n_kv_heads) / m->t.config.n_heads;
+    int kv_dim = m->t.config.n_kv_heads * m->t.head_dim;
     long L = m->t.config.n_layers, seqlen = m->t.config.seq_len;
     size_t slot = (size_t)L * n * kv_dim;
     float *ksave = malloc(slot * sizeof(float));

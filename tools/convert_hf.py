@@ -11,9 +11,12 @@ reconciles, auto-detected from which tensors the checkpoint actually carries:
      key head (a per-head-dim gain) before RoPE. Present gains are written to the
      .mq (v4) and applied in the forward pass. A checkpoint has one or the other,
      never both.
-  3. RoPE base and norm epsilon. Qwen uses theta=1e6 and eps=1e-6; they go in the
+  3. Head width (Qwen3-0.6B). Qwen3 sets head_dim on its own (0.6B: 16 heads of
+     128 over a 1024-wide stream). When it differs from dim/n_heads it goes in
+     the header (v5) and the runtime sizes q, k, v and wo from it.
+  4. RoPE base and norm epsilon. Qwen uses theta=1e6 and eps=1e-6; they go in the
      header so the runtime uses the right constants.
-  4. Rotary layout. Every HF checkpoint stores q_proj/k_proj in the "rotate-half"
+  5. Rotary layout. Every HF checkpoint stores q_proj/k_proj in the "rotate-half"
      arrangement, while mote (following llama2.c) rotates interleaved pairs. So the
      q/k weights, their biases, AND the per-head QK-norm gains are permuted back to
      interleaved here. Miss this and the model emits fluent-looking nonsense.
@@ -151,7 +154,10 @@ def main():
     NH = cfg["num_attention_heads"]
     NKV = cfg["num_key_value_heads"]
     V = cfg["vocab_size"]
-    head_size = D // NH
+    # Qwen3 can set head_dim independently of hidden_size/heads (0.6B: 128 vs
+    # 1024/16 = 64). Absent, it is dim/n_heads, as for every Llama/Qwen2.
+    head_size = int(cfg.get("head_dim") or D // NH)
+    explicit_head_dim = head_size * NH != D
     kv = NKV * head_size
     seq_len = min(args.seqlen, cfg.get("max_position_embeddings", args.seqlen))
     # newer transformers nests rope_theta under rope_parameters; older configs
@@ -162,15 +168,10 @@ def main():
     rms_eps = float(cfg.get("rms_norm_eps", 1e-5))
     shared = bool(cfg.get("tie_word_embeddings", False))
     gs = args.gs
-    if D % gs or HD % gs:
-        raise SystemExit(f"gs {gs} must divide dim {D} and hidden {HD}")
-    if NH * head_size != D:
-        raise SystemExit("mote requires dim == n_heads * head_size")
-    # Qwen3 can set head_dim independently of hidden_size/heads; mote's engine
-    # assumes head_size == dim/n_heads, so reject the mismatch loudly.
-    head_dim_cfg = int(cfg.get("head_dim", head_size))
-    if head_dim_cfg != head_size:
-        raise SystemExit(f"mote requires head_dim ({head_dim_cfg}) == dim/n_heads ({head_size})")
+    if D % gs or HD % gs or (NH * head_size) % gs:
+        raise SystemExit(f"gs {gs} must divide dim {D}, hidden {HD} and n_heads*head_dim {NH * head_size}")
+    if head_size % 2:
+        raise SystemExit(f"head_dim {head_size} must be even (RoPE rotates pairs)")
 
     def g(name):
         return sd[name]
@@ -199,14 +200,15 @@ def main():
         kn = np.stack([permute_reverse(g(f"model.layers.{l}.self_attn.k_norm.weight"), 1, head_size) for l in range(L)])
 
     print(f"config: dim={D} hidden={HD} layers={L} heads={NH}/{NKV} vocab={V} "
-          f"seq={seq_len} theta={rope_theta:g} eps={rms_eps:g} shared={shared} "
+          f"head_dim={head_size} seq={seq_len} theta={rope_theta:g} eps={rms_eps:g} shared={shared} "
           f"gs={gs} bits={args.bits} qkv_bias={has_qkv_bias} qk_norm={has_qk_norm}", flush=True)
 
     with open(args.out, "wb") as f:
         # header: 64 int32 slots (256 bytes). Stamp the lowest version that can
         # express the file, so simpler checkpoints still load on older runtimes:
-        # v4 needs qk-norm, v3 needs int4, else v2.
-        version = 4 if has_qk_norm else (3 if args.bits == 4 else 2)
+        # v5 needs an explicit head_dim, v4 qk-norm, v3 int4, else v2. A v5 file
+        # is refused by a v4 runtime rather than misread with dim/n_heads heads.
+        version = 5 if explicit_head_dim else (4 if has_qk_norm else (3 if args.bits == 4 else 2))
         h = [0] * (MQ_HEADER // 4)
         h[0] = MQ_MAGIC; h[1] = version
         h[2] = D; h[3] = HD; h[4] = L; h[5] = NH; h[6] = NKV; h[7] = V; h[8] = seq_len
@@ -217,7 +219,8 @@ def main():
         f.write(struct.pack("<f", rms_eps))      # slot 13 as float
         f.write(struct.pack("<i", args.bits))    # slot 14
         f.write(struct.pack("<i", 1 if has_qk_norm else 0))   # slot 15
-        f.write(b"\x00" * (MQ_HEADER - 16 * 4))
+        f.write(struct.pack("<i", head_size if explicit_head_dim else 0))   # slot 16 (v5)
+        f.write(b"\x00" * (MQ_HEADER - 17 * 4))
 
         # fp32 norms, then (bias xor qk-norm) — same order map_weights_quant reads
         fp32_blocks = [rms_att, rms_ffn, rms_final]

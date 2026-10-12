@@ -59,10 +59,10 @@ static char *map_qtensor(QTensor *qt, char *p, long size, int gs, int bits)
 /* Returns the end of the payload; see map_weights_fp32 for why that matters. */
 static char *map_weights_quant(Weights *w, const Config *p, int gs, int bits,
                                int shared, int has_qkv_bias, int has_qk_norm,
-                               char *base)
+                               int head_size, char *base)
 {
     long L = p->n_layers, D = p->dim, HD = p->hidden_dim;
-    int head_size = p->dim / p->n_heads;
+    long Q = (long)p->n_heads * head_size;    /* query width: D unless head_dim is set */
     long kv = (long)(p->n_kv_heads * head_size);
 
     /* norms stay fp32, first in the payload */
@@ -72,7 +72,7 @@ static char *map_weights_quant(Weights *w, const Config *p, int gs, int bits,
 
     /* optional fp32 attention biases, right after the norms */
     if (has_qkv_bias) {
-        w->bq = (float *)base; base += L * D * sizeof(float);
+        w->bq = (float *)base; base += L * Q * sizeof(float);
         w->bk = (float *)base; base += L * kv * sizeof(float);
         w->bv = (float *)base; base += L * kv * sizeof(float);
     } else {
@@ -89,10 +89,10 @@ static char *map_weights_quant(Weights *w, const Config *p, int gs, int bits,
     }
 
     base = map_qtensor(&w->q_tokens, base, (long)p->vocab_size * D, gs, bits);
-    base = map_qtensor(&w->q_wq, base, L * D * D, gs, bits);
+    base = map_qtensor(&w->q_wq, base, L * Q * D, gs, bits);
     base = map_qtensor(&w->q_wk, base, L * D * kv, gs, bits);
     base = map_qtensor(&w->q_wv, base, L * D * kv, gs, bits);
-    base = map_qtensor(&w->q_wo, base, L * D * D, gs, bits);
+    base = map_qtensor(&w->q_wo, base, L * D * Q, gs, bits);
     base = map_qtensor(&w->q_w1, base, L * D * HD, gs, bits);
     base = map_qtensor(&w->q_w2, base, L * HD * D, gs, bits);
     base = map_qtensor(&w->q_w3, base, L * D * HD, gs, bits);
@@ -103,24 +103,26 @@ static char *map_weights_quant(Weights *w, const Config *p, int gs, int bits,
     return base;
 }
 
-static int alloc_state(RunState *s, const Config *p, int quantized, int gs)
+static int alloc_state(RunState *s, const Config *p, int quantized, int gs, int head_dim)
 {
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_dim = p->n_kv_heads * head_dim;
+    int q_dim = p->n_heads * head_dim;           /* == dim unless head_dim is set */
+    int xb_dim = q_dim > p->dim ? q_dim : p->dim; /* xb holds both a normed x and the attention output */
     s->x   = calloc(p->dim, sizeof(float));
-    s->xb  = calloc(p->dim, sizeof(float));
+    s->xb  = calloc(xb_dim, sizeof(float));
     s->xb2 = calloc(p->dim, sizeof(float));
     s->hb  = calloc(p->hidden_dim, sizeof(float));
     s->hb2 = calloc(p->hidden_dim, sizeof(float));
-    s->q   = calloc(p->dim, sizeof(float));
+    s->q   = calloc(q_dim, sizeof(float));
     s->att = calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->key_cache   = calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
     s->value_cache = calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
 
     /* scratch to hold whichever activation feeds a matmul, quantized. Sized to
-     * the widest activation (hidden_dim >= dim). */
+     * the widest activation: hidden_dim, dim, or the attention output (q_dim). */
     if (quantized) {
-        int w = p->hidden_dim > p->dim ? p->hidden_dim : p->dim;
+        int w = p->hidden_dim > xb_dim ? p->hidden_dim : xb_dim;
         s->xq.q = calloc(w, sizeof(int8_t));
         s->xq.s = calloc(w / gs, sizeof(float));
     } else {
@@ -177,7 +179,8 @@ static int init_from_blob(Transformer *t, const uint8_t *base, size_t size)
         const int32_t *h = (const int32_t *)base;
         /* h[0]=magic, h[1]=version, h[2..8]=Config, h[9]=gs, h[10]=shared,
          * h[11]=has_qkv_bias, h[12]=rope_theta bits, h[13]=rms_eps bits (v2),
-         * h[14]=weight bits (v3; 0 means int8), h[15]=has_qk_norm (v4). */
+         * h[14]=weight bits (v3; 0 means int8), h[15]=has_qk_norm (v4),
+         * h[16]=head_dim (v5; 0 means dim / n_heads). */
         if (h[1] < 1 || h[1] > MQ_VERSION)
             return mote_fail("unsupported .mq version %d", h[1]);
         t->config = *(const Config *)(h + 2);
@@ -186,6 +189,11 @@ static int init_from_blob(Transformer *t, const uint8_t *base, size_t size)
         t->has_qkv_bias = (h[1] >= 2) ? h[11] : 0;
         t->qbits = (h[1] >= 3 && h[14]) ? h[14] : 8;
         t->has_qk_norm = (h[1] >= 4) ? h[15] : 0;
+        if (t->config.n_heads <= 0 || t->config.n_kv_heads <= 0)
+            return mote_fail("bad head count %d/%d", t->config.n_heads, t->config.n_kv_heads);
+        t->head_dim = (h[1] >= 5 && h[16]) ? h[16] : t->config.dim / t->config.n_heads;
+        if (t->head_dim <= 0 || t->head_dim % 2)
+            return mote_fail("bad head_dim %d", t->head_dim);
         if (t->qbits != 8 && t->qbits != 4)
             return mote_fail("unsupported weight width %d bits", t->qbits);
         /* rope_theta / eps live in the header as float bits; 0 means "unset",
@@ -195,11 +203,15 @@ static int init_from_blob(Transformer *t, const uint8_t *base, size_t size)
         memcpy(&rms_eps, &h[13], sizeof(float));
         t->rope_theta = (rope_theta > 0.0f) ? rope_theta : 10000.0f;
         t->rms_eps    = (rms_eps > 0.0f)    ? rms_eps    : 1e-5f;
+        /* the attention output (n_heads * head_dim wide) feeds the wo matmul, so
+         * it is quantized in groups too; for dim / n_heads heads it is dim. */
         if (t->gs <= 0 || (t->config.dim % t->gs) || (t->config.hidden_dim % t->gs)
+            || ((t->config.n_heads * t->head_dim) % t->gs)
             || (t->qbits == 4 && t->gs % 2))
             return mote_fail("bad group size %d for this model", t->gs);
         end = map_weights_quant(&t->weights, &t->config, t->gs, t->qbits, shared,
-                                t->has_qkv_bias, t->has_qk_norm, (char *)base + MQ_HEADER);
+                                t->has_qkv_bias, t->has_qk_norm, t->head_dim,
+                                (char *)base + MQ_HEADER);
     } else {
         t->quantized = 0;
         t->gs = 0;
@@ -209,6 +221,9 @@ static int init_from_blob(Transformer *t, const uint8_t *base, size_t size)
         t->config.vocab_size = abs(t->config.vocab_size);
         t->has_qkv_bias = 0;
         t->has_qk_norm = 0;
+        if (t->config.n_heads <= 0)
+            return mote_fail("bad head count %d", t->config.n_heads);
+        t->head_dim = t->config.dim / t->config.n_heads;   /* legacy: always derived */
         t->rope_theta = 10000.0f;
         t->rms_eps = 1e-5f;
         float *weights_ptr = (float *)base + sizeof(Config) / sizeof(float);
@@ -227,7 +242,7 @@ static int init_from_blob(Transformer *t, const uint8_t *base, size_t size)
                              "file has %llu", need, (unsigned long long)size);
     }
 
-    return alloc_state(&t->state, &t->config, t->quantized, t->gs);
+    return alloc_state(&t->state, &t->config, t->quantized, t->gs, t->head_dim);
 }
 
 int build_transformer_from_blob(Transformer *t, const void *blob, size_t size)

@@ -40,6 +40,9 @@ typedef struct {
     int dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len;
     int quantized;              /* 1 if the model is weight-quantized  */
     int qbits;                  /* weight width when quantized: 8 or 4 */
+    int head_dim;               /* width of one attention head; the KV
+                                   cache is n_layers * seq_len *
+                                   n_kv_heads * head_dim floats, twice */
 } mote_info_t;
 
 void mote_get_info(const mote *m, mote_info_t *out);

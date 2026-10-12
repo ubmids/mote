@@ -20,11 +20,14 @@
  * int32, which cannot collide with a legacy header (whose first int is `dim`).
  * v2 added optional QKV bias + rope_theta/eps in the header; v3 adds int4
  * weights (header slot 14 = bits); v4 adds optional per-head QK-norm (header
- * slot 15 = has_qk_norm), the Qwen3 attention change. Writers stamp the lowest
- * version that can express the file, so older checkpoints stay readable by
- * older runtimes. */
+ * slot 15 = has_qk_norm), the Qwen3 attention change; v5 adds an explicit
+ * head_dim (header slot 16), for models whose attention heads are not
+ * dim / n_heads wide (Qwen3-0.6B: dim 1024, 16 heads of 128). Writers stamp
+ * the lowest version that can express the file, so older checkpoints stay
+ * readable by older runtimes, and a file without slot 16 gets head_dim =
+ * dim / n_heads exactly as before. */
 #define MQ_MAGIC   0x65746F6D
-#define MQ_VERSION 4
+#define MQ_VERSION 5
 #define MQ_HEADER  256          /* header padded to this, keeps weights aligned */
 
 /* Weight tensors. In the fp32 path the `float *` fields are live and the
@@ -37,19 +40,21 @@ typedef struct {
     float *rms_final;         /* (dim)         final norm gain          */
 
     /* optional fp32 attention biases (Qwen-style q/k/v have them; Llama does not).
-     * NULL when the checkpoint carries no bias. bq is (layer, dim); bk and bv are
-     * (layer, kv_dim). Applied right after the q/k/v projections, before RoPE. */
+     * NULL when the checkpoint carries no bias. bq is (layer, q_dim); bk and bv are
+     * (layer, kv_dim). Applied right after the q/k/v projections, before RoPE.
+     * q_dim = n_heads * head_dim and kv_dim = n_kv_heads * head_dim; q_dim is
+     * dim itself unless the header sets head_dim. */
     float *bq, *bk, *bv;
 
     /* optional per-head QK-norm gains (Qwen3). RMSNorm applied to each query and
-     * key head, over head_size, right after the q/k projections and before RoPE.
-     * q_norm and k_norm are both (layer, head_size); NULL when absent. Stored
+     * key head, over head_dim, right after the q/k projections and before RoPE.
+     * q_norm and k_norm are both (layer, head_dim); NULL when absent. Stored
      * permuted to mote's interleaved rotary layout, matching the q/k weights. */
     float *q_norm, *k_norm;
 
     /* fp32 path */
     float *token_embedding;   /* (vocab, dim)                           */
-    float *wq, *wk, *wv, *wo; /* attention                              */
+    float *wq, *wk, *wv, *wo; /* attention: wq (q_dim, dim), wo (dim, q_dim) */
     float *w1, *w2, *w3;      /* ffn                                    */
     float *wcls;              /* (vocab, dim)  classifier               */
 
@@ -63,11 +68,12 @@ typedef struct {
 /* Per-step working memory. Allocated once, reused every token. */
 typedef struct {
     float *x;      /* (dim)        residual stream                 */
-    float *xb;     /* (dim)        a normed/temp copy of x         */
+    float *xb;     /* (max(dim, q_dim)) normed copy of x, then the
+                      attention output that feeds wo               */
     float *xb2;    /* (dim)        second temp                     */
     float *hb;     /* (hidden_dim) ffn buffer                      */
     float *hb2;    /* (hidden_dim) ffn buffer                      */
-    float *q;      /* (dim)        query                           */
+    float *q;      /* (q_dim)      query                           */
     float *att;    /* (n_heads, seq_len) attention scores          */
     float *logits; /* (vocab)      output distribution             */
     float *key_cache;   /* (layer, seq_len, kv_dim)                */
@@ -88,6 +94,8 @@ typedef struct {
     float  rms_eps;    /* RMSNorm epsilon (Llama 1e-5, Qwen 1e-6)         */
     int    has_qkv_bias; /* 1 if bq/bk/bv are present                     */
     int    has_qk_norm;  /* 1 if q_norm/k_norm are present (Qwen3)        */
+    int    head_dim;     /* width of one attention head: dim / n_heads unless
+                            a v5 header says otherwise (Qwen3-0.6B: 128)  */
     int    fd;         /* file descriptor of the mmap'd checkpoint */
     void  *data;       /* mmap base                                */
     ssize_t file_size;
