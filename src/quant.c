@@ -4,6 +4,15 @@
 
 #include <math.h>
 
+/* No fused multiply-add unless written out as one. Clang contracts a*b+c into
+ * an FMA by default on arm64 but cannot on baseline x86-64, and the rounding
+ * differs, so the same int4 checkpoint used to pick different greedy tokens on
+ * a Mac and on an x86 box. GCC in -std=c11 mode already never contracts. The
+ * NEON kernels still use FMA where they ask for it by name. */
+#if defined(__clang__)
+#pragma STDC FP_CONTRACT OFF
+#endif
+
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif

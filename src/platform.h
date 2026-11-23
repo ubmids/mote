@@ -40,6 +40,15 @@
 #include <sys/mman.h>
 #endif
 
+/* .mq and llama2.c checkpoints are little-endian, and the loader points
+ * straight into the mapped file instead of decoding it. Every target mote runs
+ * on today is little-endian (x86-64, arm64, QNX aarch64le, wasm); a big-endian
+ * build would load garbage, so it fails here instead. */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) \
+    && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#  error "mote reads little-endian model files in place; big-endian hosts are not supported"
+#endif
+
 /* Seconds on a clock that never jumps. Wall time (gettimeofday) moves when NTP
  * or an RTC sync steps it, and a step in the middle of a run is a wrong tok/s.
  * CLOCK_MONOTONIC is POSIX: Linux, macOS 10.12+, QNX, and emscripten. */
