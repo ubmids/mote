@@ -10,6 +10,9 @@
 #if defined(__wasm_simd128__)
 #include <wasm_simd128.h>
 #endif
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 #define QMAX 127.0f
 
@@ -46,6 +49,20 @@ void dequantize(const QTensor *in, float *x, int n, int gs)
         x[i] = in->q[i] * in->s[i / gs];
 }
 
+#if defined(__SSE2__)
+/* SSE2 has no int8 multiply and no int8 shifts, so widen to int16 first:
+ * interleaving a vector with itself puts each byte in the high half of a
+ * 16-bit lane, and an arithmetic shift right by 8 sign-extends it. */
+static inline __m128i sext_lo_i8(__m128i v) { return _mm_srai_epi16(_mm_unpacklo_epi8(v, v), 8); }
+static inline __m128i sext_hi_i8(__m128i v) { return _mm_srai_epi16(_mm_unpackhi_epi8(v, v), 8); }
+static inline int32_t hsum_i32x4(__m128i v)
+{
+    v = _mm_add_epi32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(1, 0, 3, 2)));
+    v = _mm_add_epi32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(v);
+}
+#endif
+
 /* int32 dot product of two int8 groups. Uses the NEON dot-product instruction
  * where it exists (every recent Apple chip), otherwise a plain loop. The result
  * is bit-identical either way, since it is integer arithmetic. */
@@ -78,6 +95,8 @@ static inline int32_t dot_group_i8(const int8_t *a, const int8_t *b, int gs)
         sum += (int32_t)a[k] * (int32_t)b[k];
     return sum;
 #else
+    /* x86-64 included: compilers vectorize this loop on their own (integer sums
+     * may be reordered freely), and a hand-written SSE2 body measured slower. */
     int32_t sum = 0;
     for (int k = 0; k < gs; k++)
         sum += (int32_t)a[k] * (int32_t)b[k];
@@ -220,6 +239,25 @@ static inline int32_t dot_group_q4(const int8_t *a, const uint8_t *wb, int gs)
     }
     sum = wasm_i32x4_extract_lane(acc, 0) + wasm_i32x4_extract_lane(acc, 1)
         + wasm_i32x4_extract_lane(acc, 2) + wasm_i32x4_extract_lane(acc, 3);
+#elif defined(__SSE2__)
+    /* Same split-half unpack, done in int16 lanes because SSE2 cannot shift
+     * bytes: sign-extend each packed byte, then the high nibble is >> 4 and the
+     * low nibble is << 12 then >> 12. Integer math, so the sum is exactly the
+     * scalar loop's. */
+    __m128i acc = _mm_setzero_si128();
+    for (; k + 16 <= half; k += 16) {
+        __m128i b  = _mm_loadu_si128((const __m128i *)(wb + k));
+        __m128i a0 = _mm_loadu_si128((const __m128i *)(a + k));
+        __m128i a1 = _mm_loadu_si128((const __m128i *)(a + half + k));
+        __m128i bl = sext_lo_i8(b), bh = sext_hi_i8(b);  /* bytes 0..7, 8..15 */
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(sext_lo_i8(a0),
+                                  _mm_srai_epi16(_mm_slli_epi16(bl, 12), 12)));
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(sext_hi_i8(a0),
+                                  _mm_srai_epi16(_mm_slli_epi16(bh, 12), 12)));
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(sext_lo_i8(a1), _mm_srai_epi16(bl, 4)));
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(sext_hi_i8(a1), _mm_srai_epi16(bh, 4)));
+    }
+    sum = hsum_i32x4(acc);
 #endif
     for (; k < half; k++)                     /* tail, and the whole loop when scalar */
         sum += (int32_t)a[k] * nib_lo(wb[k]) + (int32_t)a[k + half] * nib_hi(wb[k]);

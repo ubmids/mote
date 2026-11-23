@@ -12,6 +12,7 @@
 #   make posix    POSIX thread pool, any host      -> ./mote
 #   make serial   no threads, the reference build -> ./mote
 #   make check-parallel  every backend must print identical text
+#   make kernel_test   SIMD integer kernels == scalar -> ./kernel_test
 #   make qnx      cross-compile for QNX 8.0 (qcc)  -> ./mote-qnx-$(QNX_ARCH)
 #   make clean
 #
@@ -27,7 +28,7 @@ BIN     := mote
 $(BIN): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDLIBS)
 
-.PHONY: omp posix serial check-parallel qnx quantize run_ids tok_test qwen_chat registry debug clean
+.PHONY: omp posix serial check-parallel kernel_test qnx quantize run_ids tok_test qwen_chat registry debug clean
 omp: $(SRC)
 	$(CC) $(CFLAGS) -fopenmp -o $(BIN) $(SRC) $(LDLIBS)
 
@@ -47,10 +48,17 @@ check-parallel:
 CHECK_MODEL ?= models/stories15M.bin
 CHECK_TOK   ?= models/tokenizer.bin
 
+# The int8/int4 dot products have NEON, wasm and SSE2 bodies. Integer math, so
+# each must return exactly what the plain loop returns; this checks that on the
+# extremes and on random groups, for whichever body this compiler picks.
+kernel_test: tools/kernel_test.c src/quant.c src/quant.h src/parallel.c
+	$(CC) $(CFLAGS) -o $@ tools/kernel_test.c src/parallel.c $(LDLIBS)
+
 # QNX 8.0, cross-compiled with the SDP's qcc. Source qnxsdp-env.sh first (the SDP
-# runs on an x86_64 Linux or Windows host). x86_64 is the QEMU image and runs the
-# scalar kernels; aarch64le is the Raspberry Pi 5, whose Cortex-A76 has the int8
-# dot-product instructions quant.c uses. The pool in parallel.c is picked
+# runs on an x86_64 Linux or Windows host). x86_64 is the QEMU image and gets the
+# SSE2 kernels (baseline x86-64, so any QEMU CPU model has them); aarch64le is the
+# Raspberry Pi 5, whose Cortex-A76 has the int8 dot-product instructions quant.c
+# uses. The pool in parallel.c is picked
 # automatically on QNX. On the target itself (QNX Developer Desktop) there is no
 # qcc: use scripts/build_qnx.sh native.
 QNX_ARCH   ?= x86_64
@@ -58,6 +66,7 @@ QNX_MARCH_aarch64le := -march=armv8.2-a+dotprod
 QNX_CFLAGS ?= -O3 -std=c11 -Wall -Wextra $(QNX_MARCH_$(QNX_ARCH))
 qnx: $(SRC)
 	qcc -Vgcc_nto$(QNX_ARCH) $(QNX_CFLAGS) -o mote-qnx-$(QNX_ARCH) $(SRC) -lm
+	qcc -Vgcc_nto$(QNX_ARCH) $(QNX_CFLAGS) -o kernel_test-qnx-$(QNX_ARCH) tools/kernel_test.c src/parallel.c -lm
 
 # the converter reuses the engine's quantization core
 quantize: tools/quantize.c src/quant.c src/parallel.c
@@ -115,5 +124,5 @@ debug: $(SRC)
 	      -o $(BIN) $(SRC) $(LDLIBS)
 
 clean:
-	rm -f $(BIN) mote-qnx-* quantize blob2c perplexity run_ids tok_test qwen_chat lib_chat grammar_test \
+	rm -f $(BIN) mote-qnx-* kernel_test kernel_test-qnx-* quantize blob2c perplexity run_ids tok_test qwen_chat lib_chat grammar_test \
 	      intent_build intent_test

@@ -9,7 +9,7 @@
 #   Native, on the target (QNX Developer Desktop ships clang, not qcc):
 #     scripts/build_qnx.sh native
 #
-# Output: build/qnx-<arch>/mote. The engine needs nothing beyond libc and libm;
+# Output: build/qnx-<arch>/mote and kernel_test. The engine needs nothing beyond libc and libm;
 # the thread pool in src/parallel.c is selected automatically on QNX, and
 # src/platform.h turns on _QNX_SOURCE before any system header.
 set -e
@@ -40,4 +40,6 @@ out=build/qnx-$ARCH
 mkdir -p "$out"
 # shellcheck disable=SC2086
 $CC $CFLAGS -o "$out/mote" src/*.c -lm
-echo "built $out/mote"
+# shellcheck disable=SC2086
+$CC $CFLAGS -o "$out/kernel_test" tools/kernel_test.c src/parallel.c -lm
+echo "built $out/mote and $out/kernel_test (run kernel_test on the target first)"

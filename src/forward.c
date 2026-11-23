@@ -22,6 +22,9 @@
 #if defined(__wasm_simd128__)
 #include <wasm_simd128.h>
 #endif
+#if defined(__SSE2__) && !defined(__ARM_NEON)
+#include <emmintrin.h>
+#endif
 
 static void rmsnorm(float *out, const float *x, const float *weight, int size, float eps)
 {
@@ -83,6 +86,18 @@ static inline float dot_f32(const float *a, const float *b, int n)
                                                  wasm_v128_load(b + i)));
     float sum = wasm_f32x4_extract_lane(acc, 0) + wasm_f32x4_extract_lane(acc, 1)
               + wasm_f32x4_extract_lane(acc, 2) + wasm_f32x4_extract_lane(acc, 3);
+    for (; i < n; i++)
+        sum += a[i] * b[i];
+    return sum;
+#elif defined(__SSE2__)
+    /* four lanes, multiply then add (no FMA in baseline x86-64), like wasm */
+    __m128 acc = _mm_setzero_ps();
+    int i = 0;
+    for (; i + 4 <= n; i += 4)
+        acc = _mm_add_ps(acc, _mm_mul_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i)));
+    float lane[4];
+    _mm_storeu_ps(lane, acc);
+    float sum = lane[0] + lane[1] + lane[2] + lane[3];
     for (; i < n; i++)
         sum += a[i] * b[i];
     return sum;

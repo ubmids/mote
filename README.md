@@ -179,7 +179,15 @@ thread backend:
 make serial           # no threads: the reference build
 make posix            # the POSIX worker pool, on any POSIX host
 make check-parallel   # serial, pool and default must print identical text
+make kernel_test      # the SIMD integer kernels must equal the plain loops
 ```
+
+The kernels have NEON (with the int8 dot product where the chip has it), wasm
+SIMD and SSE2 bodies. SSE2 is baseline x86-64, so any x86 machine or QEMU CPU
+model gets it: about 3x on fp32 checkpoints and about 1.9x on int4 against the
+plain loops (int8 is left to the compiler, which vectorizes it as well as
+hand-written SSE2 does). Model files are little-endian and read in place, so a
+big-endian build stops at compile time.
 
 The pool is what QNX gets. The port to QNX 8.0 is in progress: the sources are
 ready for it, and nothing has been run on a QNX target yet.
