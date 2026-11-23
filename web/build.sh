@@ -12,7 +12,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 emcc -O3 -std=c11 -msimd128 -pthread \
-  src/model.c src/forward.c src/quant.c src/parallel.c \
+  src/error.c src/model.c src/forward.c src/quant.c src/parallel.c \
   src/tokenizer.c src/sampler.c src/bpe.c src/grammar.c src/intent.c src/mote_lib.c \
   -o web/mote.js \
   -sMODULARIZE=1 -sEXPORT_NAME=createMote \
