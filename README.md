@@ -168,6 +168,32 @@ Qwen2.5-0.5B (309 MB): 48 tok/s in desktop Chromium and 20 tok/s in iPhone
 Safari, up from 13.6 and 6.5 single-threaded. Still shy of the native app, but
 a real conversation from a URL with nothing installed.
 
+## Other hosts, and QNX
+
+Everything the engine asks of the operating system (map a file, read a
+monotonic clock, count cores, start threads) is in `src/platform.h` and
+`src/parallel.c`. The rest is plain C11. So a new host is mostly a choice of
+thread backend:
+
+```bash
+make serial           # no threads: the reference build
+make posix            # the POSIX worker pool, on any POSIX host
+make check-parallel   # serial, pool and default must print identical text
+```
+
+The pool is what QNX gets. The port to QNX 8.0 is in progress: the sources are
+ready for it, and nothing has been run on a QNX target yet.
+
+```bash
+source ~/qnx800/qnxsdp-env.sh             # SDP 8.0, on an x86_64 Linux/Windows host
+make qnx QNX_ARCH=x86_64                  # QEMU image  -> mote-qnx-x86_64
+make qnx QNX_ARCH=aarch64le               # Raspberry Pi 5 -> mote-qnx-aarch64le
+scripts/build_qnx.sh native               # on the target, QNX Developer Desktop (clang)
+```
+
+On a filesystem where mapping a file is unavailable, `-DMOTE_NO_MMAP` reads the
+model into memory instead.
+
 ## Roadmap
 
 `mote` is being built in three milestones, from the general to the absurd. See

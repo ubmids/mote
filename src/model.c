@@ -5,18 +5,17 @@
  * first int is `dim`). Both are memory-mapped; the weight pointers, float or
  * QTensor, are just offsets into that one mapping.
  */
+#include "platform.h"   /* first: it sets the feature macros */
+
 #include "model.h"
 
 #include "error.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <unistd.h>
 
 /* ---- fp32 layout ----
  * Returns the end of the payload, so the caller can check the file actually
@@ -147,15 +146,11 @@ static void free_state(RunState *s)
 
 static int map_file(Transformer *t, const char *path)
 {
-    t->fd = open(path, O_RDONLY);
-    if (t->fd == -1)
-        return mote_fail("open() failed on %s (errno %d)", path, errno);
-    off_t sz = lseek(t->fd, 0, SEEK_END);
-    t->file_size = sz;
-    t->data = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, t->fd, 0);
-    if (t->data == MAP_FAILED)
-        return mote_fail("mmap failed for %lld bytes (errno %d)",
-                         (long long)sz, errno);
+    size_t sz = 0;
+    t->data = mote_map_file(path, &sz, &t->fd);
+    if (t->data == NULL)
+        return mote_fail("could not open or map %s (errno %d)", path, errno);
+    t->file_size = (ssize_t)sz;
     return 0;
 }
 
@@ -267,9 +262,9 @@ int build_transformer(Transformer *t, const char *path)
 
 void free_transformer(Transformer *t)
 {
-    if (t->data != MAP_FAILED && t->data != NULL)
-        munmap(t->data, t->file_size);
-    if (t->fd != -1)
-        close(t->fd);
+    /* blob-loaded transformers have data == NULL: the caller owns the bytes */
+    mote_unmap_file(t->data, (size_t)t->file_size, t->fd);
+    t->data = NULL;
+    t->fd = -1;
     free_state(&t->state);
 }

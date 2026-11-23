@@ -9,6 +9,10 @@
 #   make registry      build registry/apartment.txt  -> registry/apartment.{mint,h}
 #   make intent_test   adversarial intent matching    -> ./intent_test
 #   make debug    warnings + sanitizers            -> ./mote
+#   make posix    POSIX thread pool, any host      -> ./mote
+#   make serial   no threads, the reference build -> ./mote
+#   make check-parallel  every backend must print identical text
+#   make qnx      cross-compile for QNX 8.0 (qcc)  -> ./mote-qnx-$(QNX_ARCH)
 #   make clean
 #
 # To import a HuggingFace Qwen2 checkpoint: tools/convert_hf.py writes a .mq the
@@ -23,9 +27,37 @@ BIN     := mote
 $(BIN): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDLIBS)
 
-.PHONY: omp quantize run_ids tok_test qwen_chat registry debug clean
+.PHONY: omp posix serial check-parallel qnx quantize run_ids tok_test qwen_chat registry debug clean
 omp: $(SRC)
 	$(CC) $(CFLAGS) -fopenmp -o $(BIN) $(SRC) $(LDLIBS)
+
+# The worker pool QNX uses, built on whatever host this is, so it can be checked
+# here before it meets the target. And the no-threads build it must agree with.
+posix: $(SRC)
+	$(CC) $(CFLAGS) -DMOTE_PTHREADS -o $(BIN) $(SRC) $(LDLIBS) -lpthread
+
+serial: $(SRC)
+	$(CC) $(CFLAGS) -DMOTE_SERIAL -o $(BIN) $(SRC) $(LDLIBS)
+
+# Greedy text from serial, pool and host-default builds must match byte for
+# byte: each matmul row is computed whole by one thread, so threading may change
+# the speed and nothing else.
+check-parallel:
+	CC="$(CC)" CFLAGS="$(CFLAGS)" ./scripts/check_parallel.sh $(CHECK_MODEL) $(CHECK_TOK)
+CHECK_MODEL ?= models/stories15M.bin
+CHECK_TOK   ?= models/tokenizer.bin
+
+# QNX 8.0, cross-compiled with the SDP's qcc. Source qnxsdp-env.sh first (the SDP
+# runs on an x86_64 Linux or Windows host). x86_64 is the QEMU image and runs the
+# scalar kernels; aarch64le is the Raspberry Pi 5, whose Cortex-A76 has the int8
+# dot-product instructions quant.c uses. The pool in parallel.c is picked
+# automatically on QNX. On the target itself (QNX Developer Desktop) there is no
+# qcc: use scripts/build_qnx.sh native.
+QNX_ARCH   ?= x86_64
+QNX_MARCH_aarch64le := -march=armv8.2-a+dotprod
+QNX_CFLAGS ?= -O3 -std=c11 -Wall -Wextra $(QNX_MARCH_$(QNX_ARCH))
+qnx: $(SRC)
+	qcc -Vgcc_nto$(QNX_ARCH) $(QNX_CFLAGS) -o mote-qnx-$(QNX_ARCH) $(SRC) -lm
 
 # the converter reuses the engine's quantization core
 quantize: tools/quantize.c src/quant.c src/parallel.c
@@ -83,5 +115,5 @@ debug: $(SRC)
 	      -o $(BIN) $(SRC) $(LDLIBS)
 
 clean:
-	rm -f $(BIN) quantize blob2c perplexity run_ids tok_test qwen_chat lib_chat grammar_test \
+	rm -f $(BIN) mote-qnx-* quantize blob2c perplexity run_ids tok_test qwen_chat lib_chat grammar_test \
 	      intent_build intent_test

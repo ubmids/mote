@@ -37,3 +37,7 @@ registry/*.h
 # wasm build output (web/build.sh)
 web/mote.js
 web/mote.wasm
+
+# QNX builds (make qnx, scripts/build_qnx.sh)
+mote-qnx-*
+build/

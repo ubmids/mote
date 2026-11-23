@@ -1,11 +1,30 @@
-/* parallel.c — platform backends for mote_parallel_for. See parallel.h. */
+/* parallel.c — platform backends for mote_parallel_for. See parallel.h.
+ *
+ * Which backend a build gets, first match wins:
+ *   -DMOTE_SERIAL                 one plain call (any host; a reference build)
+ *   -DMOTE_PTHREADS               the POSIX worker pool (any POSIX host)
+ *   Apple                         Grand Central Dispatch
+ *   -fopenmp                      OpenMP
+ *   QNX, or emscripten -pthread   the POSIX worker pool
+ *   anything else                 one plain call
+ * MOTE_PTHREADS exists so the pool can be built and checked on a laptop before
+ * it ever meets the target that needs it. */
+#include "platform.h"   /* first: it sets the feature macros */
+
 #include "parallel.h"
 
-#if defined(__APPLE__)
+#if defined(MOTE_SERIAL)
+
+void mote_parallel_for(int count, void (*fn)(int, int, void *), void *ctx)
+{
+    if (count > 0)
+        fn(0, count, ctx);
+}
+
+#elif defined(__APPLE__) && !defined(MOTE_PTHREADS)
 
 #include <dispatch/dispatch.h>
 #include <stdlib.h>
-#include <unistd.h>
 
 void mote_parallel_for(int count, void (*fn)(int, int, void *), void *ctx)
 {
@@ -20,17 +39,12 @@ void mote_parallel_for(int count, void (*fn)(int, int, void *), void *ctx)
 #ifndef MOTE_RESERVE_CORES
 #define MOTE_RESERVE_CORES 0
 #endif
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-    int chunks = ncpu > 1 ? (int)ncpu : 1;
+    int chunks = mote_cpu_count();
     if (MOTE_RESERVE_CORES > 0 && chunks > MOTE_RESERVE_CORES + 1)
         chunks -= MOTE_RESERVE_CORES;
     /* MOTE_THREADS=n splits the work into exactly n chunks, so a benchmark can
      * compare against another engine at the same thread count. Unset = all cores. */
-    static int forced = -1;            /* read once: this runs per matmul */
-    if (forced < 0) {
-        const char *mt = getenv("MOTE_THREADS");
-        forced = (mt && atoi(mt) > 0) ? atoi(mt) : 0;
-    }
+    int forced = mote_env_threads();
     if (forced > 0)
         chunks = forced;
     if (chunks > count)
@@ -47,7 +61,7 @@ void mote_parallel_for(int count, void (*fn)(int, int, void *), void *ctx)
     });
 }
 
-#elif defined(_OPENMP)
+#elif defined(_OPENMP) && !defined(MOTE_PTHREADS)
 
 #include <omp.h>
 
@@ -66,19 +80,28 @@ void mote_parallel_for(int count, void (*fn)(int, int, void *), void *ctx)
     }
 }
 
-#elif defined(__EMSCRIPTEN_PTHREADS__)
+#elif defined(__EMSCRIPTEN_PTHREADS__) || defined(MOTE_PTHREADS) || defined(__QNX__)
 
-/* WebAssembly with threads: pthreads map onto web workers, but spawning one
- * per matmul would be absurd, so a small persistent pool is built on first
- * use and then fed jobs. The calling thread works too (chunk 0), and waits on
- * a condvar for the rest; the engine already lives in a worker, where
- * blocking is allowed. Link with -sPTHREAD_POOL_SIZE so the workers exist
- * up front — creating one lazily needs the browser's main thread, which may
- * be busy, and that way lies deadlock. */
+/* A small persistent pool of POSIX threads, built on first use and then fed
+ * jobs. Spawning a thread per matmul would cost more than the matmul. The
+ * calling thread works too (chunk 0) and waits on a condvar for the rest.
+ *
+ * WebAssembly: pthreads map onto web workers. Link with -sPTHREAD_POOL_SIZE so
+ * the workers exist up front; creating one lazily needs the browser's main
+ * thread, which may be busy, and that way lies deadlock. The engine already
+ * lives in a worker, where blocking is allowed.
+ *
+ * QNX: workers are created with default attributes, so they inherit the
+ * creating thread's priority and scheduling policy. Run the engine at a
+ * real-time priority (`on -p`, or pthread_setschedparam before the first
+ * forward pass) and the whole pool runs there with it. */
 #include <pthread.h>
-#include <unistd.h>
 
-#define POOL_MAX 8
+#if defined(__EMSCRIPTEN_PTHREADS__)
+#define POOL_MAX 8     /* must not exceed web/build.sh's PTHREAD_POOL_SIZE */
+#else
+#define POOL_MAX 64
+#endif
 
 typedef struct {
     void (*fn)(int, int, void *);
@@ -124,14 +147,17 @@ void mote_parallel_for(int count, void (*fn)(int, int, void *), void *ctx)
         return;
 
     if (pool_n == 0) {
-        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-        pool_n = ncpu > POOL_MAX ? POOL_MAX : (ncpu > 1 ? (int)ncpu : 1);
+        int want = mote_env_threads();
+        if (want == 0)
+            want = mote_cpu_count();
+        pool_n = want > POOL_MAX ? POOL_MAX : want;
         for (int i = 0; i + 1 < pool_n; i++) {
             pthread_t t;
             if (pthread_create(&t, NULL, worker, (void *)(long)i) != 0) {
                 pool_n = i + 1;   /* run with what we got */
                 break;
             }
+            pthread_detach(t);
         }
     }
 

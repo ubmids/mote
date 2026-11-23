@@ -7,21 +7,17 @@
  *   mote <checkpoint> [-z tokenizer] [-t temp] [-p topp] [-n steps]
  *                     [-i prompt] [-s seed]
  */
+#include "platform.h"   /* first: it sets the feature macros */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
+#include <time.h>
 
 #include "model.h"
 #include "tokenizer.h"
 #include "sampler.h"
 
-static long now_ms(void)
-{
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000L + tv.tv_usec / 1000;
-}
 
 /* Don't let raw control bytes from byte-fallback tokens corrupt the terminal. */
 static void safe_print(const char *piece)
@@ -49,7 +45,7 @@ static void generate(Transformer *t, Tokenizer *tk, Sampler *sampler,
         exit(1);
     }
 
-    long start = 0;
+    double start = 0.0;
     int token = prompt_tokens[0];
     int pos = 0;
     while (pos < steps) {
@@ -69,14 +65,14 @@ static void generate(Transformer *t, Tokenizer *tk, Sampler *sampler,
         fflush(stdout);
         token = next;
 
-        if (start == 0) start = now_ms();   /* skip the warm first token */
+        if (start == 0.0) start = mote_now_s();   /* skip the warm first token */
     }
     printf("\n");
 
     if (pos > 1) {
-        long end = now_ms();
+        double end = mote_now_s();
         fprintf(stderr, "\n[%d tokens, %.1f tok/s]\n",
-                pos, (pos - 1) / (double)(end - start) * 1000.0);
+                pos, (pos - 1) / (end - start));
     }
     free(prompt_tokens);
 }
@@ -119,7 +115,9 @@ int main(int argc, char **argv)
         }
     }
     if (temperature < 0.0f) temperature = 0.0f;
-    if (seed == 0) seed = (unsigned long long)now_ms();
+    if (seed == 0)   /* wall clock for variety, the monotonic clock for its nanoseconds */
+        seed = (unsigned long long)time(NULL) * 1000003ULL
+             ^ (unsigned long long)(mote_now_s() * 1e9);
 
     Transformer transformer;
     if (build_transformer(&transformer, checkpoint) != 0)
