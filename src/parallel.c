@@ -8,7 +8,9 @@
  *   QNX, or emscripten -pthread   the POSIX worker pool
  *   anything else                 one plain call
  * MOTE_PTHREADS exists so the pool can be built and checked on a laptop before
- * it ever meets the target that needs it. */
+ * it ever meets the target that needs it. MOTE_FOLLOW_PRIORITY makes the pool's
+ * workers track the caller's scheduling priority job by job (always on for QNX;
+ * see the pool below). */
 #include "platform.h"   /* first: it sets the feature macros */
 
 #include "parallel.h"
@@ -94,8 +96,23 @@ void mote_parallel_for(int count, void (*fn)(int, int, void *), void *ctx)
  * QNX: workers are created with default attributes, so they inherit the
  * creating thread's priority and scheduling policy. Run the engine at a
  * real-time priority (`on -p`, or pthread_setschedparam before the first
- * forward pass) and the whole pool runs there with it. */
+ * forward pass) and the whole pool runs there with it.
+ *
+ * Inheriting once is not enough when the caller's priority changes later, which
+ * on QNX it does whenever a server thread picks up a message: it runs at the
+ * priority of the client that sent it. Workers stuck at the first caller's
+ * priority would then compute a low-priority client's tokens at a high priority
+ * (stealing time from whatever real-time work sits between the two), or a
+ * high-priority client's tokens at a low one. So on QNX, or with
+ * -DMOTE_FOLLOW_PRIORITY anywhere else, each job first moves the workers to the
+ * calling thread's policy and priority, when those have changed. Callers must
+ * already serialize jobs (there is one job slot), so this needs no extra lock. */
 #include <pthread.h>
+#include <sched.h>
+
+#if defined(__QNX__) || defined(MOTE_FOLLOW_PRIORITY)
+#define FOLLOW_PRIORITY 1
+#endif
 
 #if defined(__EMSCRIPTEN_PTHREADS__)
 #define POOL_MAX 8     /* must not exceed web/build.sh's PTHREAD_POOL_SIZE */
@@ -114,6 +131,29 @@ static pthread_cond_t cv_work = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t cv_done = PTHREAD_COND_INITIALIZER;
 static Job job;
 static int generation, pending, pool_n;
+static pthread_t pool_tid[POOL_MAX];
+
+#ifdef FOLLOW_PRIORITY
+/* Move every worker to the calling thread's scheduling policy and priority.
+ * Two kernel calls per worker, and only when the caller's priority differs
+ * from the last job's, so steady-state cost is one getschedparam per job. A
+ * worker that cannot be moved (no privilege for that policy) keeps running
+ * where it was; the job still completes, it just is not re-prioritized. */
+static void follow_caller_priority(void)
+{
+    static int last_policy = -1, last_prio;
+    int policy;
+    struct sched_param sp;
+    if (pthread_getschedparam(pthread_self(), &policy, &sp) != 0)
+        return;
+    if (policy == last_policy && sp.sched_priority == last_prio)
+        return;
+    for (int i = 0; i + 1 < pool_n; i++)
+        pthread_setschedparam(pool_tid[i], policy, &sp);
+    last_policy = policy;
+    last_prio = sp.sched_priority;
+}
+#endif
 
 static void *worker(void *arg)
 {
@@ -152,12 +192,11 @@ void mote_parallel_for(int count, void (*fn)(int, int, void *), void *ctx)
             want = mote_cpu_count();
         pool_n = want > POOL_MAX ? POOL_MAX : want;
         for (int i = 0; i + 1 < pool_n; i++) {
-            pthread_t t;
-            if (pthread_create(&t, NULL, worker, (void *)(long)i) != 0) {
+            if (pthread_create(&pool_tid[i], NULL, worker, (void *)(long)i) != 0) {
                 pool_n = i + 1;   /* run with what we got */
                 break;
             }
-            pthread_detach(t);
+            pthread_detach(pool_tid[i]);
         }
     }
 
@@ -166,6 +205,10 @@ void mote_parallel_for(int count, void (*fn)(int, int, void *), void *ctx)
         fn(0, count, ctx);
         return;
     }
+
+#ifdef FOLLOW_PRIORITY
+    follow_caller_priority();
+#endif
 
     pthread_mutex_lock(&mu);
     job.fn = fn; job.ctx = ctx; job.count = count; job.chunks = chunks;
