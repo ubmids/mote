@@ -192,6 +192,16 @@ big-endian build stops at compile time.
 The pool is what QNX gets. The port to QNX 8.0 is in progress: the sources are
 ready for it, and nothing has been run on a QNX target yet.
 
+A host that shares one engine between callers of different priority can act
+between any two forward passes, not only between generated tokens:
+`mote_set_step_hook` is called after every step, prompt replay included, so a
+lock can be handed to a more urgent caller part way through someone else's
+long prompt (or the turn stopped there). It observes only; `make
+step_hook_test` checks the text is byte-identical with and without it, and
+that two contexts handed over at every step print what each prints alone. And
+after a constrained call, `mote_last_choice` says how sure the model was of
+what it chose, so a host can ask before acting on a close call.
+
 ```bash
 source ~/qnx800/qnxsdp-env.sh             # SDP 8.0, on an x86_64 Linux/Windows host
 make qnx QNX_ARCH=x86_64                  # QEMU image  -> mote-qnx-x86_64
