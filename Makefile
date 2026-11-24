@@ -5,6 +5,7 @@
 #   make quantize the fp32 -> int8/int4 converter  -> ./quantize
 #   make run_ids  drive the engine on token IDs    -> ./run_ids
 #   make grammar_test  constrained-decoding tests  -> ./grammar_test
+#   make step_hook_test  the step hook changes nothing -> ./step_hook_test
 #   make intent_build  compile a command registry    -> ./intent_build
 #   make registry      build registry/apartment.txt  -> registry/apartment.{mint,h}
 #   make intent_test   adversarial intent matching    -> ./intent_test
@@ -94,6 +95,11 @@ lib_chat: tools/lib_chat.c $(ENGINE) src/bpe.c src/mote_lib.c src/grammar.c src/
 grammar_test: tools/grammar_test.c $(ENGINE) src/bpe.c src/mote_lib.c src/grammar.c src/intent.c
 	$(CC) $(CFLAGS) -Isrc -o $@ tools/grammar_test.c $(ENGINE) src/bpe.c src/mote_lib.c src/grammar.c src/intent.c $(LDLIBS)
 
+# the per-step hook (prompt replay included) must not change a byte of output,
+# and two contexts handed over at every step must print their solo text
+step_hook_test: tools/step_hook_test.c $(ENGINE) src/bpe.c src/mote_lib.c src/grammar.c src/intent.c
+	$(CC) $(CFLAGS) -Isrc -o $@ tools/step_hook_test.c $(ENGINE) src/bpe.c src/mote_lib.c src/grammar.c src/intent.c $(LDLIBS) -lpthread
+
 # emit a model as a const C array to link into firmware (weights in flash)
 blob2c: tools/blob2c.c
 	$(CC) $(CFLAGS) -o $@ tools/blob2c.c
@@ -124,5 +130,5 @@ debug: $(SRC)
 	      -o $(BIN) $(SRC) $(LDLIBS)
 
 clean:
-	rm -f $(BIN) mote-qnx-* kernel_test kernel_test-qnx-* quantize blob2c perplexity run_ids tok_test qwen_chat lib_chat grammar_test \
+	rm -f $(BIN) mote-qnx-* kernel_test kernel_test-qnx-* quantize blob2c perplexity run_ids tok_test qwen_chat lib_chat grammar_test step_hook_test \
 	      intent_build intent_test

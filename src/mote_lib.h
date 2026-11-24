@@ -66,6 +66,27 @@ mote *mote_create_from_files(const char *model_path, const char *tokenizer_path)
 int mote_generate(mote *m, const char *prompt, const mote_params *params,
                   int (*on_token)(const char *piece, void *user), void *user);
 
+/* ---- step hook -------------------------------------------------------------
+ *
+ * on_token only fires for generated text, but most of the work in a turn with a
+ * long prompt is replaying that prompt, one forward pass per token. A host that
+ * shares one engine between callers of different priority (a QNX resource
+ * manager, say) needs a boundary it can act on during that replay as well, or
+ * an urgent caller waits behind someone else's whole prompt.
+ *
+ * The hook is called after every forward pass of mote_generate and
+ * mote_generate_constrained, prompt and generated tokens alike. `pos` is how
+ * many positions the KV cache now holds; `prefill` is 1 while the prompt is
+ * still being replayed. Return non-zero to continue, 0 to stop: generation ends
+ * there, nothing more is emitted, and the prompt prefix already computed stays
+ * in the cache for the next call. Between two steps the context is idle, so the
+ * hook may release a lock and let another context run on the same weights.
+ *
+ * The hook only observes. With or without one, the text produced is the same
+ * byte for byte (tools/step_hook_test.c checks this). NULL removes it. */
+typedef int (*mote_step_fn)(int pos, int prefill, void *user);
+void mote_set_step_hook(mote *m, mote_step_fn fn, void *user);
+
 /* Embed a text as a single vector: the model's final hidden states, mean-pooled
  * over the text's tokens and L2-normalized, written to out[dim] (dim from
  * mote_get_info). The model doubles as its own embedding model, which is what
@@ -130,6 +151,32 @@ int mote_generate_constrained(mote *m, const char *prompt, const mote_params *pa
                               mote_grammar *g,
                               int (*on_token)(const char *piece, void *user),
                               void *user);
+
+/* How sure was the model of the document it just wrote?
+ *
+ * A grammar guarantees the answer is one of the allowed values, not that it is
+ * the right one, and a host about to act on it (open a window, start a fan)
+ * needs to know the difference between a clear choice and a coin flip. After a
+ * constrained call this reports, over the tokens the model chose:
+ *
+ *   prob        the product of each chosen token's probability, renormalized
+ *               over the tokens the grammar allowed at that step. For an enum
+ *               this is the probability of the value along the path taken;
+ *               another spelling of the same value would add to it, so this
+ *               errs low, which is the safe side for a gate.
+ *   min_margin  the smallest gap, at any step, between the chosen token's
+ *               probability and the best alternative's: the closest call made.
+ *
+ * Steps the schema forces (a single legal token) count as certain. The model's
+ * own distribution is used (temperature 1) whatever temperature sampled.
+ * Values are reset by every generate call; steps == 0 means nothing was chosen
+ * under a grammar. */
+typedef struct {
+    int   steps;
+    float prob;
+    float min_margin;
+} mote_choice;
+void mote_last_choice(const mote *m, mote_choice *out);
 
 /* ---- intent matching -----------------------------------------------------
  *

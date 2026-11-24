@@ -25,6 +25,7 @@ qwen_chat
 lib_chat
 
 grammar_test
+step_hook_test
 intent_build
 intent_test
 

@@ -33,7 +33,57 @@ struct mote {
      * prefix (fixed system prompt + unchanged history). Transparent + safe. */
     int        *kv_tokens;
     int         kv_count;
+    /* Called after every forward pass, prompt or generated (mote_set_step_hook). */
+    mote_step_fn step_fn;
+    void        *step_user;
+    /* How sure the model was of what it wrote under the last grammar. */
+    mote_choice  choice;
 };
+
+void mote_set_step_hook(mote *m, mote_step_fn fn, void *user)
+{
+    if (!m)
+        return;
+    m->step_fn = fn;
+    m->step_user = user;
+}
+
+void mote_last_choice(const mote *m, mote_choice *out)
+{
+    if (m && out)
+        *out = m->choice;
+}
+
+/* Fold one constrained step into the running choice statistics. Read-only on
+ * the logits and called before the sampler touches them, so the token drawn is
+ * exactly what it would have been without this.
+ *
+ * The probabilities are the model's own (temperature 1) renormalized over the
+ * tokens the grammar allowed at that step. A step with a single legal token,
+ * such as the punctuation the schema fixes, contributes 1 to both numbers, so
+ * what is left is the uncertainty of the choices the model actually made. */
+static void choice_fold(mote_choice *c, const float *logits, const unsigned char *allow,
+                        int n, int chosen)
+{
+    float mx = -1e30f;
+    for (int i = 0; i < n; i++)
+        if (allow[i] && logits[i] > mx) mx = logits[i];
+    double sum = 0.0, best_other = 0.0, pc = 0.0;
+    for (int i = 0; i < n; i++) {
+        if (!allow[i]) continue;
+        double e = exp((double)logits[i] - mx);
+        sum += e;
+        if (i == chosen) pc = e;
+        else if (e > best_other) best_other = e;
+    }
+    if (sum <= 0.0)
+        return;
+    double p = pc / sum, margin = (pc - best_other) / sum;
+    c->steps++;
+    c->prob *= (float)p;
+    if ((float)margin < c->min_margin)
+        c->min_margin = (float)margin;
+}
 
 static int blob_is_mtok(const void *b, size_t n)
 {
@@ -168,7 +218,33 @@ struct mote_grammar {
     GrammarToken  *vocab;
     unsigned char *allow;
     int            vocab_size;
+    float         *raw;      /* sampled (temperature > 0) runs only: the logits
+                                before the sampler rescales them in place */
 };
+
+/* Draw the next token under the grammar and record how sure the model was.
+ * Greedy leaves the allowed logits untouched (only the forbidden ones are
+ * masked), so the statistics are read straight from them after the argmax.
+ * Sampling softmaxes in place, so the raw values are copied first. Either way
+ * the token drawn is exactly what sample_constrained alone would draw. */
+static int choice_pick(mote *m, mote_grammar *G, float *logits)
+{
+    int n = m->t.config.vocab_size;
+    const float *raw = logits;
+    if (m->s.temperature != 0.0f) {
+        if (!G->raw)
+            G->raw = malloc((size_t)n * sizeof(float));
+        raw = G->raw;
+        if (raw)
+            memcpy(G->raw, logits, (size_t)n * sizeof(float));
+    }
+    int next = sample_constrained(&m->s, logits, G->allow);
+    if (raw)
+        choice_fold(&m->choice, raw, G->allow, n, next);
+    else
+        m->choice.min_margin = m->choice.prob = 0.0f;   /* unknown: never confident */
+    return next;
+}
 
 /* Project the tokenizer's vocabulary into raw byte strings for the grammar.
  *
@@ -236,6 +312,7 @@ void mote_grammar_free(mote_grammar *mg)
     grammar_free(mg->g);
     free(mg->vocab);
     free(mg->allow);
+    free(mg->raw);
     free(mg);
 }
 
@@ -305,6 +382,9 @@ int mote_generate_constrained(mote *m, const char *prompt, const mote_params *p,
     /* every call starts a new document */
     if (G)
         grammar_reset(G->g);
+    m->choice.steps = 0;
+    m->choice.prob = 1.0f;
+    m->choice.min_margin = 1.0f;
     int aborted = 0;   /* the caller asked to stop; do not tidy up after them */
     long model_bytes = 0;   /* bytes the model itself chose, under a grammar */
 
@@ -343,6 +423,13 @@ int mote_generate_constrained(mote *m, const char *prompt, const mote_params *p,
                 m->kv_tokens[pos] = token;
             float *logits = forward(&m->t, token, pos);
             pos++;
+            /* A step boundary, including while the prompt is replayed: the
+             * caller may hand the engine to someone else here, or stop. The
+             * KV cache is valid for [0, pos) whichever it does. */
+            if (m->step_fn && !m->step_fn(pos, pos < n_prompt, m->step_user)) {
+                aborted = 1;
+                break;
+            }
             int next;
             if (pos < n_prompt) {
                 next = toks[pos];            /* still replaying the prompt */
@@ -360,7 +447,7 @@ int mote_generate_constrained(mote *m, const char *prompt, const mote_params *p,
                  * grammar already bounds the document, which is what the
                  * penalty was standing in for. */
                 if (grammar_mask(G->g, G->allow) == 0) break;
-                next = sample_constrained(&m->s, logits, G->allow);
+                next = choice_pick(m, G, logits);
                 grammar_accept(G->g, next);
                 int len; const char *piece = bpe_decode(m->bpe, next, &len);
                 if (len >= (int)sizeof(piecebuf)) len = sizeof(piecebuf) - 1;
@@ -423,6 +510,11 @@ int mote_generate_constrained(mote *m, const char *prompt, const mote_params *p,
     RecentTokens recent = { {0}, 0, 0 };
     while (pos < steps) {
         float *logits = forward(&m->t, token, pos);
+        /* step boundary, as in the BPE path above */
+        if (m->step_fn && !m->step_fn(pos + 1, pos < n_prompt - 1, m->step_user)) {
+            aborted = 1;
+            break;
+        }
 
         int next;
         if (pos < n_prompt - 1) {
@@ -431,7 +523,7 @@ int mote_generate_constrained(mote *m, const char *prompt, const mote_params *p,
             if (G) {
                 /* no repetition penalty under a grammar; see the note above */
                 if (grammar_mask(G->g, G->allow) == 0) break;
-                next = sample_constrained(&m->s, logits, G->allow);
+                next = choice_pick(m, G, logits);
                 grammar_accept(G->g, next);
             } else {
                 penalize_repeats(&recent, logits, repeat_penalty);
